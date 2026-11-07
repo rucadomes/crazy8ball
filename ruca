@@ -1,0 +1,1865 @@
+if _G.PoolTrainingHelper then pcall(_G.PoolTrainingHelper.Stop) end
+local H={Enabled=true,Running=true,ShowCollisions=false,Version="lucky8-1",Stats={},Group="Unknown"}
+_G.PoolTrainingHelper=H
+local MIRROR=false
+local SIM_SLICE=0.006
+local REMOVE_HOLD=0.6
+local LABEL_MAX=260
+local STUDS_PER_INCH=0.16
+local INF=math.huge
+local atan2=math.atan2 or math.atan
+local function clamp(v,a,b) if v<a then return a elseif v>b then return b end return v end
+local function sign(v) if v>0 then return 1 elseif v<0 then return -1 end return 0 end
+local C={
+ R=1.125,Gravity=386.09,SlidingFriction=0.2,RollingFriction=0.0125,SideSpinDecel=10.9,BallRestitution=0.95,
+ BallFrictionTable={{0,0.118},{20,0.072},{40,0.046},{80,0.022},{120,0.014},{200,0.01}},
+ BallSlipEpsilon=1e-9,RailBySpeed={{20,0.9},{300,0.6}},RailFriction=0.2,
+ RestSpeed=0.25,SlideEpsilon=1e-4,MaxShotSeconds=40,MaxEventsPerStep=200,MaxInstantHits=24,InstantHitSeconds=1e-7,ContactSlop=1e-5,
+ SlateRestitution=0.6,SlateFriction=0.2,ClothHopLossSpeed=0,MinHopSpeed=8,FlatStrikeBounce=0.4,PerchSpeed=6,PerchSlideSpeed=6,
+ AirStepSeconds=0.0004166666666666667,BallContactMicroseconds=200,BallContactReferenceSpeed=100,ClusterGapInches=0.02,
+ SoftContactStep=2e-6,SoftContactMaxSeconds=0.003,SoftContactMaxHopInches=0.5,SoftContactSkinInches=0.05,FixedStep=0.004166666666666667,
+ HalfLength=50,HalfWidth=25,JawRadius=0.3,FacingLength=1.6,CornerFacingDegrees=38,SideFacingDegrees=13,
+ PocketShelfBallRadii=0.9,PocketTipMinDegrees=1.5,PocketDropDepth=5,PocketFunnelAccel=900,PocketDragPerSecond=5,PocketWallRestitution=0.25,
+ MaxSpeed=440,MinSpeed=15,StickMass=19,BallMass=6,TipRestitution=0.73,MaxSpinOffset=0.5,
+ PowerAnchors={{0.04,15},{0.1,27},{0.3,60},{0.5,100},{0.75,180},{1,440}},
+ CueElevation=4,MaxElevation=60,JumpMaxStickSpeed=211,JumpCap=15,MinPowerToShoot=0.04
+}
+local DIAM=C.R*2
+C.CushionHeight=0.8*DIAM
+C.CornerMouth=2*DIAM
+C.SideMouth=2.2*DIAM
+C.CornerPocketRadius=C.CornerMouth/2
+C.SidePocketRadius=C.SideMouth/2
+C.SidePocketInset=C.SideMouth/2
+C.CornerShelf=0.6666666666666666*DIAM
+C.CushionNose=0.635*DIAM
+local MASS_RATIO=C.BallMass/C.StickMass
+do
+ local e=math.rad(C.CueElevation)
+ local v5=1+MASS_RATIO+2.5*math.sin(e)^2
+ local v7=(math.sqrt(1-(1-((1-MASS_RATIO*C.TipRestitution)^2+MASS_RATIO*(1+C.TipRestitution)^2)/(1+MASS_RATIO)^2)/MASS_RATIO*v5)+1)/v5*math.cos(e)
+ C.MinStickSpeed=C.MinSpeed/v7
+ C.MaxStickSpeed=C.MaxSpeed/v7
+end
+
+local function anchorSpeed(p)
+ local a=C.PowerAnchors
+ if p<=a[1][1] then return a[1][2] end
+ for i=2,#a do
+  local c=a[i]
+  if p<=c[1] then local q=a[i-1] return q[2]*(c[2]/q[2])^((p-q[1])/(c[1]-q[1])) end
+ end
+ return a[#a][2]
+end
+local function powerShare(p)
+ return clamp((anchorSpeed(clamp(p,0,1))-C.MinSpeed)/(C.MaxSpeed-C.MinSpeed),0,1)
+end
+
+local function newBall(id,x,y)
+ return {id=id,x=x,y=y,z=0,vx=0,vy=0,vz=0,wx=0,wy=0,wz=0,pocketed=false,offTable=false,falling=false,pocket=nil,tip=nil}
+end
+local function ballSpeed(b) return math.sqrt(b.vx*b.vx+b.vy*b.vy) end
+local function isMoving(b)
+ if b.pocketed then return b.falling end
+ return b.vx~=0 or b.vy~=0 or b.wx~=0 or b.wy~=0 or b.z>0 or b.vz~=0
+end
+local function stopBall(b) b.vx=0 b.vy=0 b.vz=0 b.wx=0 b.wy=0 b.wz=0 end
+local function kinetic(b,mass,g)
+ if b.pocketed then return 0 end
+ return (b.vx*b.vx+b.vy*b.vy+b.vz*b.vz)*0.5+(g or 0)*b.z+mass*0.2*(b.wx*b.wx+b.wy*b.wy+b.wz*b.wz)
+end
+
+local function isAirborne(b) return not b.pocketed and (b.z>0 or b.vz>0) end
+local function landingTime(h,vz)
+ local g=C.Gravity
+ return (vz+math.sqrt(math.max(0,vz*vz+2*g*math.max(h,0))))/g
+end
+local function fly(b,dt)
+ local g=C.Gravity
+ local lt=landingTime(b.z,b.vz)
+ local ft=math.min(lt,dt)
+ b.x=b.x+b.vx*ft b.y=b.y+b.vy*ft
+ if lt<=dt then b.vz=b.vz-g*lt b.z=0
+ else b.z=math.max(0,b.z+b.vz*ft-0.5*g*ft*ft) b.vz=b.vz-g*ft end
+ return ft
+end
+local function slate(b,impact,force,rest,fric)
+ local bounce=(rest or C.SlateRestitution)*impact-C.ClothHopLossSpeed
+ local should=C.MinHopSpeed<=bounce
+ b.z=0 b.vz=0
+ if not (should or force) then return false end
+ local eff=impact+(should and bounce or 0)
+ local sx=b.vx-C.R*b.wy
+ local sy=b.vy+C.R*b.wx
+ local ss=math.sqrt(sx*sx+sy*sy)
+ if C.SlideEpsilon<ss then
+  local fi=math.min(ss/3.5,(fric or C.SlateFriction)*eff)
+  local dx,dy=sx/ss,sy/ss
+  b.vx=b.vx-fi*dx b.vy=b.vy-fi*dy
+  b.wx=b.wx-fi*2.5*dy/C.R b.wy=b.wy+fi*2.5*dx/C.R
+ end
+ if should then b.vz=bounce end
+ return should
+end
+
+local function segmentTOI(x,y,vx,vy,r,s,maxT)
+ local nv=vx*s.nx+vy*s.ny
+ if nv>=0 then return nil end
+ local d=(x-s.ax)*s.nx+(y-s.ay)*s.ny
+ if d<0 then return nil end
+ local t
+ if d<=r then t=0 else t=(d-r)/-nv end
+ if maxT<t then return nil end
+ local cx=x+vx*t-r*s.nx
+ local cy=y+vy*t-r*s.ny
+ local sx,sy=s.bx-s.ax,s.by-s.ay
+ local p=((cx-s.ax)*sx+(cy-s.ay)*sy)/(sx*sx+sy*sy)
+ if p>=0 and p<=1 then return t end
+ return nil
+end
+local function pointTOI(x,y,vx,vy,ra,px,py,rb,maxT)
+ local ox,oy=x-px,y-py
+ local vd=(ox*vx+oy*vy)*2
+ if vd>=0 then return nil,0,0 end
+ local vs=vx*vx+vy*vy
+ if vs<=0 then return nil,0,0 end
+ local cr=ra+rb
+ local ds=ox*ox+oy*oy-cr*cr
+ local t
+ if ds<=0 then t=0 else
+  local disc=vd*vd-vs*4*ds
+  if disc<0 then return nil,0,0 end
+  t=(-vd-math.sqrt(disc))/(vs*2)
+ end
+ if maxT<t then return nil,0,0 end
+ local nx,ny=x+vx*t-px,y+vy*t-py
+ local nl=math.sqrt(nx*nx+ny*ny)
+ if nl<1e-12 then return nil,0,0 end
+ return t,nx/nl,ny/nl
+end
+local function circleTOI(x,y,vx,vy,cx,cy,cvx,cvy,r,maxT)
+ local ox,oy=x-cx,y-cy
+ local rx,ry=vx-cvx,vy-cvy
+ local vd=(ox*rx+oy*ry)*2
+ if vd>=0 then return nil end
+ local vs=rx*rx+ry*ry
+ if vs<=0 then return nil end
+ local cr=r*2
+ local ds=ox*ox+oy*oy-cr*cr
+ local t
+ if ds<=0 then t=0 else
+  local disc=vd*vd-vs*4*ds
+  if disc<0 then return nil end
+  t=(-vd-math.sqrt(disc))/(vs*2)
+ end
+ if maxT>=t then return t end
+ return nil
+end
+local function sphereTOI(x,y,z,vx,vy,vz,sx,sy,sz,svx,svy,svz,r,maxT)
+ local ox,oy,oz=x-sx,y-sy,z-sz
+ local rx,ry,rz=vx-svx,vy-svy,vz-svz
+ local vd=(ox*rx+oy*ry+oz*rz)*2
+ if vd>=0 then return nil end
+ local vs=rx*rx+ry*ry+rz*rz
+ if vs<=0 then return nil end
+ local cr=r*2
+ local ds=ox*ox+oy*oy+oz*oz-cr*cr
+ local t
+ if ds<=0 then t=0 else
+  local disc=vd*vd-vs*4*ds
+  if disc<0 then return nil end
+  t=(-vd-math.sqrt(disc))/(vs*2)
+ end
+ if maxT>=t then return t end
+ return nil
+end
+
+local function buildTable()
+ local g={halfLength=C.HalfLength,halfWidth=C.HalfWidth,pocketsOpen=true,segments={},points={},pockets={}}
+ local hl,hw=g.halfLength,g.halfWidth
+ local cm=C.CornerMouth/1.4142135623730951
+ local sm=C.SideMouth/2
+ local ca=math.rad(C.CornerFacingDegrees)
+ local sa=math.rad(C.SideFacingDegrees)
+ local cs=C.CornerShelf/1.4142135623730951
+ local cpr=C.CornerPocketRadius
+ local shx,shy=-cm-cs,-cs
+ local proj=shx*math.cos(ca)+shy*math.sin(ca)
+ local cfl=-proj-math.sqrt(proj*proj-(shx*shx+shy*shy-cpr*cpr))
+ local function seg(ax,ay,bx,by,nx,ny) g.segments[#g.segments+1]={ax=ax,ay=ay,bx=bx,by=by,nx=nx,ny=ny} end
+ local function pt(x,y,r) g.points[#g.points+1]={x=x,y=y,radius=r} end
+ local function facing(x,y,dx,dy,nx,ny,len)
+  len=len or C.FacingLength
+  local ex,ey=x+dx*len,y+dy*len
+  seg(x,y,ex,ey,nx,ny)
+  pt(x,y,0)
+  pt(ex,ey,C.JawRadius)
+ end
+ for _,side in ipairs({1,-1}) do
+  seg(-hl+cm,side*hw,-sm,side*hw,0,-side)
+  seg(sm,side*hw,hl-cm,side*hw,0,-side)
+  facing(-sm,side*hw,-math.sin(sa),side*math.cos(sa),math.cos(sa),side*math.sin(sa))
+  facing(sm,side*hw,math.sin(sa),side*math.cos(sa),-math.cos(sa),side*math.sin(sa))
+  for _,dir in ipairs({1,-1}) do
+   facing(dir*(hl-cm),side*hw,dir*math.cos(ca),side*math.sin(ca),dir*math.sin(ca),-side*math.cos(ca),cfl)
+  end
+ end
+ for _,side in ipairs({1,-1}) do
+  seg(side*hl,-hw+cm,side*hl,hw-cm,-side,0)
+  for _,dir in ipairs({1,-1}) do
+   facing(side*hl,dir*(hw-cm),side*math.sin(ca),dir*math.cos(ca),-side*math.cos(ca),dir*math.sin(ca),cfl)
+  end
+ end
+ local px,py=hl+cs,hw+cs
+ local spr=C.SidePocketRadius
+ g.pockets={
+  {id=1,x=-px,y=py,radius=cpr},{id=2,x=0,y=hw+C.SidePocketInset,radius=spr},{id=3,x=px,y=py,radius=cpr},
+  {id=4,x=px,y=-py,radius=cpr},{id=5,x=0,y=-hw-C.SidePocketInset,radius=spr},{id=6,x=-px,y=-py,radius=cpr}
+ }
+ return g
+end
+local GEO=buildTable()
+local LARGEST_POCKET=math.max(C.CornerPocketRadius,C.SidePocketRadius)
+local function containsCenter(g,x,y,pad)
+ pad=pad or 0
+ return math.abs(x)<=g.halfLength+pad and math.abs(y)<=g.halfWidth+pad
+end
+local function openingAt(g,x,y)
+ if not (math.abs(x)<g.halfLength-LARGEST_POCKET and math.abs(y)<g.halfWidth-LARGEST_POCKET) then
+  for _,p in ipairs(g.pockets) do
+   local ox,oy=x-p.x,y-p.y
+   if math.sqrt(ox*ox+oy*oy)<=p.radius then return p end
+  end
+ end
+ return nil
+end
+local SHELF_DISTANCE=C.PocketShelfBallRadii*C.R+C.CornerShelf/1.4142135623730951
+local function pocketAt(g,x,y)
+ if math.abs(x)<g.halfLength-LARGEST_POCKET and math.abs(y)<g.halfWidth-LARGEST_POCKET then return nil end
+ local nd,np=INF,nil
+ for _,p in ipairs(g.pockets) do
+  local ox,oy=x-p.x,y-p.y
+  local d=math.sqrt(ox*ox+oy*oy)
+  if d<=p.radius then return p end
+  if d<nd then nd=d np=p end
+ end
+ if not containsCenter(g,x,y,SHELF_DISTANCE) then return np end
+ return nil
+end
+
+local function clampSpin(sx,sy)
+ local m=C.MaxSpinOffset
+ local l=math.max(math.abs(sx),math.abs(sy))
+ if l==0 then return 0,0 end
+ local nx,ny=sx/l,sy/l
+ local nm=math.sqrt(nx*nx+ny*ny)
+ if m/nm<l then return nx/nm*m,ny/nm*m end
+ return sx,sy
+end
+local function stickSpeedForPower(power,elev)
+ local ef=clamp(((elev or C.CueElevation)-C.CueElevation)/(C.JumpCap-C.CueElevation),0,1)
+ local mx=C.MaxStickSpeed+(C.JumpMaxStickSpeed-C.MaxStickSpeed)*ef
+ return C.MinStickSpeed+(mx-C.MinStickSpeed)*powerShare(power)
+end
+local function strike(b,shot)
+ local R=C.R
+ local sx,sy=0,0
+ if shot.spin then sx,sy=clampSpin(shot.spin.x,shot.spin.y) end
+ local elev=math.rad(clamp(shot.elevation or C.CueElevation,0,C.MaxElevation))
+ local ec,es=math.cos(elev),math.sin(elev)
+ local rem=math.sqrt(1-sx*sx-sy*sy)
+ local eff=math.min(elev,math.rad(C.CueElevation))
+ local vspin=sy*ec-rem*math.sin(eff)
+ local m=MASS_RATIO
+ local impactFactor=1+m+(sx*sx+vspin*vspin)*2.5
+ local e=C.TipRestitution
+ local energy=1-(1-((1-m*e)^2+m*(1+e)^2)/(1+m)^2)/m*impactFactor
+ local impact=stickSpeedForPower(shot.power,math.deg(elev))*(math.sqrt(math.max(0,energy))+1)/impactFactor
+ local hs=impact*ec
+ local dx,dy=math.cos(shot.angle),math.sin(shot.angle)
+ b.vx=dx*hs b.vy=dy*hs b.vz=0 b.z=0
+ local sf=2.5*impact/R
+ local top=sf*vspin
+ b.wx=-dy*top
+ b.wy=dx*top
+ b.wz=sf*sx*ec
+ local jf=clamp((math.deg(elev)-C.CueElevation)/(C.JumpCap-C.CueElevation),0,1)
+ local sr=C.SlateRestitution*(C.FlatStrikeBounce+(1-C.FlatStrikeBounce)*jf)
+ slate(b,impact*es,false,sr,C.SlateFriction*jf)
+ return hs
+end
+
+local function ballFriction(speed)
+ local t=C.BallFrictionTable
+ if speed<=t[1][1] then return t[1][2] end
+ for i=2,#t do
+  local c=t[i]
+  if speed<=c[1] then local p=t[i-1] return p[2]+(speed-p[1])/(c[1]-p[1])*(c[2]-p[2]) end
+ end
+ return t[#t][2]
+end
+local function frictionImpulse(vx,vy,sx,sy,sz,nx,ny,imp)
+ local R=C.R
+ local slx=-vx*ny+vy*nx+R*sz
+ local sly=R*(sx*ny-sy*nx)
+ local ss=math.sqrt(slx*slx+sly*sly)
+ if ss>C.BallSlipEpsilon then
+  local f=math.min(ballFriction(ss)*imp,ss/7)
+  return -f*slx/ss,-f*sly/ss
+ end
+ return 0,0
+end
+local contactStiffness,restitutionDamping=0,0
+local function groupEnergy(balls)
+ local e=0
+ for _,b in ipairs(balls) do e=e+kinetic(b,C.R) end
+ return e
+end
+local function resolveContacts(balls,ballA,ballB)
+ local R=C.R
+ local n=#balls
+ local step=C.SoftContactStep
+ local half=step*0.5
+ local maxSteps=math.max(1,math.floor(C.SoftContactMaxSeconds/step+0.5))
+ local skin=C.SoftContactSkinInches
+ local dia=R*2
+ local dia2=dia*dia
+ local cd=dia+skin
+ local cd2=cd*cd
+ local k,damp=contactStiffness,restitutionDamping
+ local px,py,vx,vy,sx,sy,sz={},{},{},{},{},{},{}
+ for i,b in ipairs(balls) do px[i]=b.x py[i]=b.y vx[i]=b.vx vy[i]=b.vy sx[i]=b.wx sy[i]=b.wy sz[i]=b.wz end
+ local e0=groupEnergy(balls)
+ local total=math.sqrt(e0*2)
+ local rebuild
+ if total>0 then rebuild=math.max(1,math.floor(skin/(total*2*step))) else rebuild=maxSteps end
+ local pf,ps,acc,cnx,cny={},{},{},{},{}
+ local dvx,dvy={},{}
+ for i=1,n do dvx[i]=0 dvy[i]=0 end
+ local count,stepIndex,counter,had=0,0,0,false
+ local function rebuildPairs()
+  count=0
+  for i=1,n do
+   local fx,fy=px[i],py[i]
+   for j=i+1,n do
+    local dx,dy=px[j]-fx,py[j]-fy
+    if dx*dx+dy*dy<cd2 then count=count+1 pf[count]=i ps[count]=j acc[count]=0 end
+   end
+  end
+ end
+ rebuildPairs()
+ while true do
+  for i=1,n do dvx[i]=0 dvy[i]=0 end
+  local active=count
+  local hits=0
+  for c=1,active do
+   local i,j=pf[c],ps[c]
+   local dx,dy=px[j]-px[i],py[j]-py[i]
+   local d2=dx*dx+dy*dy
+   if d2<dia2 then
+    hits=hits+1
+    local d=math.sqrt(d2)
+    local nx,ny=dx/d,dy/d
+    local ov=dia-d
+    local orr=math.sqrt(ov)
+    local rv=(vx[i]-vx[j])*nx+(vy[i]-vy[j])*ny
+    local imp=k*ov*orr+damp*math.sqrt(orr)*rv
+    if imp<0 then imp=0 end
+    acc[c]=imp cnx[c]=nx cny[c]=ny
+    dvx[i]=dvx[i]-imp*nx dvy[i]=dvy[i]-imp*ny
+    dvx[j]=dvx[j]+imp*nx dvy[j]=dvy[j]+imp*ny
+   else acc[c]=0 end
+  end
+  if stepIndex>0 then
+   for i=1,n do vx[i]=vx[i]+half*dvx[i] vy[i]=vy[i]+half*dvy[i] end
+   if hits==0 then
+    if had then break end
+   else
+    had=true
+    for c=1,active do
+     local imp=acc[c]
+     if imp>0 then
+      local i,j=pf[c],ps[c]
+      local nx,ny=cnx[c],cny[c]
+      local fx,fy=frictionImpulse(vx[i]-vx[j],vy[i]-vy[j],sx[i]+sx[j],sy[i]+sy[j],sz[i]+sz[j],nx,ny,imp*step)
+      if fx~=0 or fy~=0 then
+       local ux,uy=-ny*fx,nx*fx
+       vx[i]=vx[i]+ux vy[i]=vy[i]+uy vx[j]=vx[j]-ux vy[j]=vy[j]-uy
+       local wx=ny*2.5*fy/R
+       local wy=nx*-2.5*fy/R
+       local wz=2.5*fx/R
+       sx[i]=sx[i]+wx sy[i]=sy[i]+wy sz[i]=sz[i]+wz
+       sx[j]=sx[j]+wx sy[j]=sy[j]+wy sz[j]=sz[j]+wz
+      end
+     end
+    end
+   end
+  end
+  if maxSteps<=stepIndex then break end
+  stepIndex=stepIndex+1
+  for i=1,n do
+   local nvx=vx[i]+half*dvx[i]
+   local nvy=vy[i]+half*dvy[i]
+   vx[i]=nvx vy[i]=nvy
+   px[i]=px[i]+step*nvx py[i]=py[i]+step*nvy
+  end
+  counter=counter+1
+  if rebuild<=counter then counter=0 rebuildPairs() end
+ end
+ for i,b in ipairs(balls) do b.x=px[i] b.y=py[i] b.vx=vx[i] b.vy=vy[i] b.wx=sx[i] b.wy=sy[i] b.wz=sz[i] end
+ for _=1,4 do
+  local ok=true
+  for i=1,n do
+   local a=balls[i]
+   for j=i+1,n do
+    local b=balls[j]
+    local dx,dy=b.x-a.x,b.y-a.y
+    local d=math.sqrt(dx*dx+dy*dy)
+    local md=dia+C.ContactSlop
+    if d<md and d>1e-12 then
+     local corr=(md-d)/2
+     a.x=a.x-dx/d*corr a.y=a.y-dy/d*corr
+     b.x=b.x+dx/d*corr b.y=b.y+dy/d*corr
+     ok=false
+    end
+   end
+  end
+  if ok then break end
+ end
+ local e1=groupEnergy(balls)
+ if e0<e1 then
+  local ax,ay=0,0
+  for _,b in ipairs(balls) do ax=ax+b.vx ay=ay+b.vy end
+  ax=ax/n ay=ay/n
+  local rel=0
+  for _,b in ipairs(balls) do local rx,ry=b.vx-ax,b.vy-ay rel=rel+0.5*(rx*rx+ry*ry) end
+  local ex=e1-e0
+  local sc=0
+  if ex<rel then sc=math.sqrt((rel-ex)/rel) end
+  for _,b in ipairs(balls) do b.vx=ax+(b.vx-ax)*sc b.vy=ay+(b.vy-ay)*sc end
+ end
+ return stepIndex*step
+end
+do
+ local cdur=C.BallContactMicroseconds*1e-6/2.9432
+ contactStiffness=math.sqrt(0.25/(C.BallContactReferenceSpeed*cdur*cdur*cdur*cdur*cdur))
+ local ref=C.BallContactReferenceSpeed
+ local function rest(d)
+  restitutionDamping=d
+  local a=newBall(0,0,0)
+  local b=newBall(1,2*C.R,0)
+  a.vx=ref
+  resolveContacts({a,b},a,b)
+  return (b.vx-a.vx)/ref
+ end
+ local target=C.BallRestitution
+ if rest(0)<=target then restitutionDamping=0 else
+  local lo,hi=0,math.sqrt(contactStiffness)
+  while target<rest(hi) do lo=hi hi=hi*2 end
+  for _=1,48 do
+   local mid=(lo+hi)/2
+   if target<rest(mid) then lo=mid else hi=mid end
+  end
+  restitutionDamping=(lo+hi)/2
+ end
+end
+local function clusterTouches(balls,a,b,ex)
+ local md=2*C.R+C.ClusterGapInches
+ local md2=md*md
+ for _,x in ipairs(balls) do
+  if x~=a and x~=b and not x.pocketed and not (ex and ex[x]) then
+   local ax,ay=x.x-a.x,x.y-a.y
+   local bx,by=x.x-b.x,x.y-b.y
+   if ax*ax+ay*ay<=md2 or bx*bx+by*by<=md2 then return true end
+  end
+ end
+ return false
+end
+local function clusterGather(balls,a,b,g,ex,ignoredBall)
+ local R=C.R
+ local mct=C.SoftContactMaxSeconds
+ local inc={[a]=true,[b]=true}
+ local cl={a,b}
+ local energy=kinetic(a,R)+kinetic(b,R)
+ local expanded=true
+ while expanded do
+  local ss=math.sqrt(2*energy)
+  expanded=false
+  for _,x in ipairs(balls) do
+   if not (inc[x] or x.pocketed or (ex and ex[x])) then
+    local sr=2*R+math.max(C.ClusterGapInches,(ss+ballSpeed(x))*mct)
+    for _,c in ipairs(cl) do
+     local dx,dy=x.x-c.x,x.y-c.y
+     if dx*dx+dy*dy<=sr*sr then
+      inc[x]=true cl[#cl+1]=x energy=energy+kinetic(x,R) expanded=true
+      break
+     end
+    end
+   end
+  end
+ end
+ for _,x in ipairs(cl) do if x~=ignoredBall and isAirborne(x) then return nil end end
+ local margin=math.max(R,C.CornerPocketRadius,C.SidePocketRadius)+math.sqrt(2*energy)*mct
+ for _,x in ipairs(cl) do
+  if math.abs(x.x)+margin>=g.halfLength or math.abs(x.y)+margin>=g.halfWidth then return nil end
+ end
+ local out={}
+ for _,x in ipairs(balls) do if inc[x] then out[#out+1]=x end end
+ return out
+end
+
+local function integrateFalling(b,dt,p)
+ b.vz=b.vz-C.Gravity*dt
+ b.z=b.z+b.vz*dt
+ if p then
+  local ox,oy=b.x-p.x,b.y-p.y
+  local d=math.sqrt(ox*ox+oy*oy)
+  if d>1e-6 then
+   b.vx=b.vx-ox/d*C.PocketFunnelAccel*dt
+   b.vy=b.vy-oy/d*C.PocketFunnelAccel*dt
+  end
+ end
+ local drag=math.max(0,1-C.PocketDragPerSecond*dt)
+ b.vx=b.vx*drag b.vy=b.vy*drag
+ b.x=b.x+b.vx*dt b.y=b.y+b.vy*dt
+ if p then
+  local ox,oy=b.x-p.x,b.y-p.y
+  local d=math.sqrt(ox*ox+oy*oy)
+  local wr=math.max(p.radius-C.R,0)
+  if wr<d and d>1e-6 then
+   local dx,dy=ox/d,oy/d
+   b.x=p.x+dx*wr b.y=p.y+dy*wr
+   local out=b.vx*dx+b.vy*dy
+   if out>0 then
+    b.vx=b.vx-(1+C.PocketWallRestitution)*out*dx
+    b.vy=b.vy-(1+C.PocketWallRestitution)*out*dy
+   end
+  end
+ end
+ if b.z>-C.PocketDropDepth then return end
+ b.z=-C.PocketDropDepth
+ stopBall(b)
+ b.falling=false
+ b.tip=nil
+end
+local function integrateTip(b,dt,p)
+ local t=b.tip
+ if not t then return end
+ local R,g=C.R,C.Gravity
+ t.px=t.px+b.vx*dt t.py=t.py+b.vy*dt
+ t.omega=t.omega+5*g/(7*R)*math.sin(t.theta)*dt
+ t.theta=t.theta+t.omega*dt
+ local s,c=math.sin(t.theta),math.cos(t.theta)
+ b.x=t.px+R*s*t.nx b.y=t.py+R*s*t.ny b.z=R*(c-1)
+ b.wx=-t.ny*t.omega b.wy=t.nx*t.omega
+ if R*t.omega*t.omega<g*c and t.theta<math.pi/2 then return end
+ local as=R*t.omega
+ b.vx=b.vx+t.nx*as*c b.vy=b.vy+t.ny*as*c b.vz=-as*s
+ b.tip=nil
+ if p then b.pocket=p.id end
+end
+local function leaveTable(b)
+ b.pocketed=true b.offTable=true b.falling=false b.pocket=nil b.tip=nil
+end
+local integrateBall
+integrateBall=function(b,dt,g)
+ if b.pocketed then
+  local p=b.pocket and g.pockets[b.pocket] or nil
+  if b.tip then integrateTip(b,dt,p) elseif b.falling then integrateFalling(b,dt,p) end
+ elseif b.z<=0 and b.vz<=0 then
+  local R,grav=C.R,C.Gravity
+  local sf,rf=C.SlidingFriction,C.RollingFriction
+  local slx=b.vx-R*b.wy
+  local sly=b.vy+R*b.wx
+  local ss=math.sqrt(slx*slx+sly*sly)
+  local remaining
+  if C.SlideEpsilon<ss then
+   local dx,dy=slx/ss,sly/ss
+   local st
+   if sf>0 then st=ss/(3.5*sf*grav) else st=INF end
+   local tt=math.min(st,dt)
+   local ac=-sf*grav
+   local aa=2.5*sf*grav/R
+   b.x=b.x+b.vx*tt+0.5*ac*dx*tt*tt
+   b.y=b.y+b.vy*tt+0.5*ac*dy*tt*tt
+   b.vx=b.vx+ac*dx*tt b.vy=b.vy+ac*dy*tt
+   b.wx=b.wx-aa*dy*tt b.wy=b.wy+aa*dx*tt
+   remaining=dt-tt
+   if st<=dt then b.wx=-b.vy/R b.wy=b.vx/R end
+  else remaining=dt end
+  if remaining>0 then
+   local sp=math.sqrt(b.vx*b.vx+b.vy*b.vy)
+   if sp>0 then
+    local de=rf*grav
+    local stop
+    if de>0 then stop=sp/de else stop=INF end
+    local tt=math.min(stop,remaining)
+    local dx,dy=b.vx/sp,b.vy/sp
+    b.x=b.x+b.vx*tt-0.5*de*dx*tt*tt
+    b.y=b.y+b.vy*tt-0.5*de*dy*tt*tt
+    if stop<=remaining then b.vx=0 b.vy=0 else b.vx=b.vx-de*dx*tt b.vy=b.vy-de*dy*tt end
+   end
+   b.wx=-b.vy/R b.wy=b.vx/R
+  end
+  if b.wz~=0 then b.wz=b.wz-sign(b.wz)*math.min(math.abs(b.wz),C.SideSpinDecel*dt) end
+  local sp=math.sqrt(b.vx*b.vx+b.vy*b.vy)
+  local ax=b.vx-R*b.wy
+  local ay=b.vy+R*b.wx
+  if sp<C.RestSpeed and math.sqrt(ax*ax+ay*ay)<C.SlideEpsilon then b.vx=0 b.vy=0 b.wx=0 b.wy=0 end
+ else
+  local ft=fly(b,dt)
+  if ft<dt then
+   if not openingAt(g,b.x,b.y) then
+    if containsCenter(g,b.x,b.y,C.R) then
+     slate(b,-b.vz,true)
+     integrateBall(b,dt-ft,g)
+    else leaveTable(b) end
+   end
+  end
+ end
+end
+local function railRestitution(speed)
+ local t=C.RailBySpeed
+ if speed<=t[1][1] then return t[1][2] end
+ for i=2,#t do
+  local u=t[i]
+  if speed<=u[1] then local l=t[i-1] return l[2]+(speed-l[1])/(u[1]-l[1])*(u[2]-l[2]) end
+ end
+ return t[#t][2]
+end
+local function resolveRail(b,nx,ny,rest,fric)
+ local R=C.R
+ local nh=C.CushionNose/R-1
+ local nz=math.sqrt(1-nh*nh)
+ local tx=-ny
+ local ns=b.vx*nx+b.vy*ny
+ if ns>=0 then return 0 end
+ local ts=b.vx*tx+b.vy*nx
+ local nsp=b.wx*nx+b.wy*ny
+ local tsp=b.wx*tx+b.wy*nx
+ local side=b.wz
+ local impact=-ns
+ local ti=ts-R*(nz*side+nh*nsp)
+ local ni=nh*ns+R*tsp
+ local slip=math.sqrt(ti*ti+ni*ni)
+ local mfi=(rest+1)*nz*impact
+ local ix,iy=0,0
+ if slip>0 then
+  local fi=math.min(slip/3.5,fric*mfi)
+  iy=-fi*ti/slip
+  ix=-fi*ni/slip
+ end
+ local nns=ns+(mfi*nz+ix*nh)
+ local nts=ts+iy
+ local nnsp=nsp-2.5*nh*iy/R
+ local ntsp=tsp+ix*2.5/R
+ local nside=side-nz*2.5*iy/R
+ local rn=math.abs(nns)
+ b.vx=rn*nx+nts*tx b.vy=rn*ny+nts*nx
+ b.wx=nnsp*nx+ntsp*tx b.wy=nnsp*ny+ntsp*nx
+ b.wz=nside
+ return impact
+end
+local function resolveBalls3D(a,b,rest)
+ local R=C.R
+ rest=rest or C.BallRestitution
+ local aG=not isAirborne(a)
+ local bG=not isAirborne(b)
+ local ox,oy,oz=b.x-a.x,b.y-a.y,b.z-a.z
+ local d=math.sqrt(ox*ox+oy*oy+oz*oz)
+ if d<1e-12 then return 0 end
+ local nx,ny,nz=ox/d,oy/d,oz/d
+ local rn=(a.vx-b.vx)*nx+(a.vy-b.vy)*ny+(a.vz-b.vz)*nz
+ if rn<=0 then return 0 end
+ local g=C.Gravity
+ local perch=nil
+ local psx,psy=0,0
+ local total=kinetic(a,R,g)+kinetic(b,R,g)
+ local er
+ if math.abs(nz)>0.5 and rn<C.PerchSpeed then
+  local vd=nz<0 and -1 or 1
+  if nz<0 then perch=a else perch=b end
+  local sx,sy=vd*nx,vd*ny
+  local sl=math.sqrt(sx*sx+sy*sy)
+  if sl<1e-6 then sx=1 sy=0 sl=1 end
+  psx=sx/sl*C.PerchSlideSpeed psy=sy/sl*C.PerchSlideSpeed
+  er=0
+ else er=rest end
+ local ni=(1+er)*rn/2
+ a.vx=a.vx-ni*nx a.vy=a.vy-ni*ny a.vz=a.vz-ni*nz
+ b.vx=b.vx+ni*nx b.vy=b.vy+ni*ny b.vz=b.vz+ni*nz
+ local sx,sy,sz=a.wx+b.wx,a.wy+b.wy,a.wz+b.wz
+ local slx=a.vx-b.vx+R*(sy*nz-sz*ny)
+ local sly=a.vy-b.vy+R*(sz*nx-sx*nz)
+ local slz=a.vz-b.vz+R*(sx*ny-sy*nx)
+ local nsl=slx*nx+sly*ny+slz*nz
+ local tx,ty,tz=slx-nsl*nx,sly-nsl*ny,slz-nsl*nz
+ local ts=math.sqrt(tx*tx+ty*ty+tz*tz)
+ if C.BallSlipEpsilon<ts then
+  local fi=math.min(ballFriction(ts)*ni,ts/7)
+  local dx,dy,dz=tx/ts,ty/ts,tz/ts
+  a.vx=a.vx-fi*dx a.vy=a.vy-fi*dy a.vz=a.vz-fi*dz
+  b.vx=b.vx+fi*dx b.vy=b.vy+fi*dy b.vz=b.vz+fi*dz
+  local si=fi*-2.5/R
+  local wx=si*(ny*dz-nz*dy)
+  local wy=si*(nz*dx-nx*dz)
+  local wz=si*(nx*dy-ny*dx)
+  a.wx=a.wx+wx a.wy=a.wy+wy a.wz=a.wz+wz
+  b.wx=b.wx+wx b.wy=b.wy+wy b.wz=b.wz+wz
+ end
+ if aG then a.vz=0 end
+ if bG then b.vz=0 end
+ if not perch then return rn end
+ local ivx,ivy=perch.vx,perch.vy
+ perch.vx=ivx+psx perch.vy=ivy+psy
+ if total<kinetic(a,R,g)+kinetic(b,R,g) then
+  local lo,hi=0,1
+  for _=1,20 do
+   local al=(lo+hi)/2
+   perch.vx=ivx+psx*al perch.vy=ivy+psy*al
+   if total<kinetic(a,R,g)+kinetic(b,R,g) then hi=al else lo=al end
+  end
+  perch.vx=ivx+psx*lo perch.vy=ivy+psy*lo
+ end
+ return rn
+end
+local function resolveBalls(a,b,rest)
+ if a.z>0 or a.vz>0 or b.z>0 or b.vz>0 then return resolveBalls3D(a,b,rest) end
+ rest=rest or C.BallRestitution
+ local ox,oy=b.x-a.x,b.y-a.y
+ local d=math.sqrt(ox*ox+oy*oy)
+ if d<1e-12 then return 0 end
+ local nx,ny=ox/d,oy/d
+ local rn=(a.vx-b.vx)*nx+(a.vy-b.vy)*ny
+ if rn<=0 then return 0 end
+ local ni=(1+rest)*rn/2
+ a.vx=a.vx-ni*nx a.vy=a.vy-ni*ny
+ b.vx=b.vx+ni*nx b.vy=b.vy+ni*ny
+ local fx,fy=frictionImpulse(a.vx-b.vx,a.vy-b.vy,a.wx+b.wx,a.wy+b.wy,a.wz+b.wz,nx,ny,ni)
+ if fx~=0 or fy~=0 then
+  local R=C.R
+  local ux,uy=-ny*fx,nx*fx
+  a.vx=a.vx+ux a.vy=a.vy+uy b.vx=b.vx-ux b.vy=b.vy-uy
+  local wx=2.5*ny*fy/R
+  local wy=-2.5*nx*fy/R
+  local wz=2.5*fx/R
+  a.wx=a.wx+wx a.wy=a.wy+wy a.wz=a.wz+wz
+  b.wx=b.wx+wx b.wy=b.wy+wy b.wz=b.wz+wz
+ end
+ return rn
+end
+local function capturePockets(state)
+ local R,g=C.R,C.Gravity
+ local minTip=math.rad(C.PocketTipMinDegrees)
+ for _,b in ipairs(state.balls) do
+  if not b.pocketed then
+   if b.z>0 or b.vz>0 then
+    if b.z<C.CushionHeight then
+     local p=openingAt(state.geometry,b.x,b.y)
+     if p then b.pocketed=true b.falling=true b.pocket=p.id b.wz=0 b.wx=0 b.wy=0 end
+    end
+   else
+    local p=pocketAt(state.geometry,b.x,b.y)
+    if p then
+     b.pocketed=true b.falling=true b.pocket=p.id b.wz=0
+     local ox,oy=b.x-p.x,b.y-p.y
+     local d=math.sqrt(ox*ox+oy*oy)
+     local depth=(p.radius-d)/R
+     if d>1e-6 and depth<1 then
+      local dx,dy=ox/d,oy/d
+      local ix,iy=-dx,-dy
+      local ta=math.max(math.asin(depth),minTip)
+      local is=math.max(b.vx*ix+b.vy*iy,0)
+      local as=is/(R*math.cos(ta))
+      if R*as*as<g*math.cos(ta) then
+       b.vx=b.vx-is*ix b.vy=b.vy-is*iy
+       b.tip={px=p.x+dx*p.radius,py=p.y+dy*p.radius,nx=ix,ny=iy,theta=ta,omega=as}
+      else b.wx=0 b.wy=0 end
+     else b.wx=0 b.wy=0 end
+    end
+   end
+  end
+ end
+end
+local function goesOver(g,x,y,z,vx,vy)
+ local R=C.R
+ if not openingAt(g,x,y) then
+  if not containsCenter(g,x,y,R) then return true end
+  if z>=C.CushionHeight then
+   for _,s in ipairs(g.segments) do
+    local d=(x-s.ax)*s.nx+(y-s.ay)*s.ny
+    if d<R and -R<d and vx*s.nx+vy*s.ny<0 then
+     local sx,sy=s.bx-s.ax,s.by-s.ay
+     local p=((x-s.ax)*sx+(y-s.ay)*sy)/(sx*sx+sy*sy)
+     if p>=0 and p<=1 then return true end
+    end
+   end
+   for _,p in ipairs(g.points) do
+    local ox,oy=x-p.x,y-p.y
+    local cr=R+p.radius
+    if ox*ox+oy*oy<cr*cr and ox*vx+oy*vy<0 then return true end
+   end
+  end
+ end
+ return false
+end
+local function checkOffTable(state)
+ for _,b in ipairs(state.balls) do
+  if isAirborne(b) and goesOver(state.geometry,b.x,b.y,b.z,b.vx,b.vy) then leaveTable(b) end
+ end
+end
+local function findEarliestHit(state,maxT,ignored,checkAir)
+ local R=C.R
+ local g=state.geometry
+ local balls=state.balls
+ local n=#balls
+ local et,eh=maxT,nil
+ for i=1,n do
+  local a=balls[i]
+  if not (a.pocketed or (ignored and ignored[a])) then
+   local aAir=checkAir and isAirborne(a)
+   local aMov=a.vx~=0 or a.vy~=0 or aAir
+   local sr=math.sqrt(a.vx*a.vx+a.vy*a.vy)*maxT+R
+   local near=math.abs(a.x)+sr>=g.halfLength or math.abs(a.y)+sr>=g.halfWidth
+   if aMov and near and a.z<C.CushionHeight then
+    for _,s in ipairs(g.segments) do
+     local t=segmentTOI(a.x,a.y,a.vx,a.vy,R,s,et)
+     if t and t<et then et=t eh={kind="rail",t=t,a=a,nx=s.nx,ny=s.ny,seg=s} end
+    end
+    for _,p in ipairs(g.points) do
+     local t,nx,ny=pointTOI(a.x,a.y,a.vx,a.vy,R,p.x,p.y,p.radius,et)
+     if t and t<et then et=t eh={kind="point",t=t,a=a,nx=nx,ny=ny} end
+    end
+   end
+   for j=i+1,n do
+    local b=balls[j]
+    if not b.pocketed and not (ignored and ignored[b]) then
+     local bAir=checkAir and isAirborne(b)
+     local bMov=b.vx~=0 or b.vy~=0 or bAir
+     if aMov or bMov then
+      local t
+      if aAir or bAir then t=sphereTOI(a.x,a.y,a.z,a.vx,a.vy,a.vz,b.x,b.y,b.z,b.vx,b.vy,b.vz,R,et)
+      else t=circleTOI(a.x,a.y,a.vx,a.vy,b.x,b.y,b.vx,b.vy,R,et) end
+      if t and t<et then et=t eh={kind="ball",t=t,a=a,b=b,nx=0,ny=0} end
+     end
+    end
+   end
+  end
+ end
+ return eh
+end
+local function pushOut(hit)
+ local R,slop=C.R,C.ContactSlop
+ local a=hit.a
+ if hit.kind=="rail" and hit.seg then
+  local s=hit.seg
+  local d=(a.x-s.ax)*s.nx+(a.y-s.ay)*s.ny
+  if d<R+slop then a.x=a.x+(R+slop-d)*s.nx a.y=a.y+(R+slop-d)*s.ny end
+ elseif hit.kind=="ball" and hit.b and (isAirborne(a) or isAirborne(hit.b)) then
+  local b=hit.b
+  local ox,oy,oz=b.x-a.x,b.y-a.y,b.z-a.z
+  local d=math.sqrt(ox*ox+oy*oy+oz*oz)
+  local md=2*R+slop
+  if d>1e-12 and d<md then
+   local aA,bA=isAirborne(a),isAirborne(b)
+   local nx,ny,nz=ox/d,oy/d,oz/d
+   local share
+   if not aA then share=0 elseif bA then share=0.5 else share=1 end
+   local corr=md-d
+   local function move(x,dir,sh)
+    if sh<=0 then return end
+    local pz=x.z
+    x.x=x.x+dir*nx*corr*sh x.y=x.y+dir*ny*corr*sh
+    x.z=math.max(0,x.z+dir*nz*corr*sh)
+    local hc=x.z-pz
+    if hc<=0 then return end
+    local ke=0.5*(x.vx*x.vx+x.vy*x.vy+x.vz*x.vz)
+    if ke>0 then
+     local sc=math.sqrt(math.max(0,ke-C.Gravity*hc)/ke)
+     x.vx=x.vx*sc x.vy=x.vy*sc x.vz=x.vz*sc
+    end
+   end
+   move(a,-1,share)
+   move(b,1,1-share)
+  end
+ elseif hit.kind=="ball" and hit.b then
+  local b=hit.b
+  local ox,oy=b.x-a.x,b.y-a.y
+  local d=math.sqrt(ox*ox+oy*oy)
+  local md=2*R+slop
+  if d>1e-12 and d<md then
+   local corr=(md-d)/2
+   local nx,ny=ox/d,oy/d
+   a.x=a.x-nx*corr a.y=a.y-ny*corr b.x=b.x+nx*corr b.y=b.y+ny*corr
+  end
+ end
+end
+local function layFlat(flyer,other,group)
+ local R,g=C.R,C.Gravity
+ local ox,oy,oz=other.x-flyer.x,other.y-flyer.y,other.z-flyer.z
+ local hd=math.sqrt(ox*ox+oy*oy)
+ local nx,ny=1,0
+ if hd>1e-12 then nx=ox/hd ny=oy/hd end
+ local md=2*R+C.ContactSlop
+ if hd<md then flyer.x=flyer.x-nx*(md-hd) flyer.y=flyer.y-ny*(md-hd) end
+ local ge=0
+ for _,b in ipairs(group) do ge=ge+kinetic(b,R,g) end
+ local vd=math.sqrt(math.max(4*R*R-oz*oz,1e-12))
+ return {flyer=flyer,group=group,nx=nx,ny=ny,tilt=-oz/vd,vx=flyer.vx,vy=flyer.vy,energy=ge}
+end
+local function liftFlyer(f)
+ local R,g=C.R,C.Gravity
+ local fl=f.flyer
+ local rs=(f.vx-fl.vx)*f.nx+(f.vy-fl.vy)*f.ny
+ if rs<=0 then return end
+ fl.vz=fl.vz+f.tilt*rs
+ if fl.z<=0 and fl.vz<0 then fl.vz=0 end
+ local ke,pe=0,0
+ for _,b in ipairs(f.group) do
+  local te=kinetic(b,R,g)
+  local ve=0.5*b.vz*b.vz+g*b.z
+  ke=ke+te-ve pe=pe+ve
+ end
+ if ke>0 and ke+pe>f.energy then
+  local sc=math.sqrt(math.max(0,f.energy-pe)/ke)
+  for _,b in ipairs(f.group) do b.vx=b.vx*sc b.vy=b.vy*sc b.wx=b.wx*sc b.wy=b.wy*sc b.wz=b.wz*sc end
+ end
+end
+local function noteHit(state,a,b)
+ if state.first then return end
+ if a.id==0 then state.first=b.id state.contact={x=a.x,y=a.y}
+ elseif b.id==0 then state.first=a.id state.contact={x=b.x,y=b.y} end
+end
+local advance
+advance=function(state,dt,ignored,allowClusters)
+ local instant={}
+ local remaining=dt
+ local count=0
+ while remaining>1e-9 and count<C.MaxEventsPerStep do
+  count=count+1
+  local stepTime=remaining
+  local checkAir=false
+  for _,b in ipairs(state.balls) do
+   if not b.pocketed and (b.z>0 or b.vz>0) then
+    if not ignored or not ignored[b] then stepTime=math.min(remaining,C.AirStepSeconds) checkAir=true break end
+   end
+   stepTime=remaining
+  end
+  local hit=findEarliestHit(state,stepTime,ignored,checkAir)
+  if hit then stepTime=hit.t end
+  for _,b in ipairs(state.balls) do
+   if not ignored or not ignored[b] then integrateBall(b,stepTime,state.geometry) end
+  end
+  state.time=state.time+stepTime
+  local unused=remaining-stepTime
+  capturePockets(state)
+  if checkAir then checkOffTable(state) end
+  if not hit or hit.a.pocketed or (hit.b and hit.b.pocketed) then
+   remaining=unused
+  else
+   local b=hit.b
+   local flyer=nil
+   if b and isAirborne(hit.a)~=isAirborne(b) then
+    if isAirborne(hit.a) then flyer=hit.a else flyer=b end
+   end
+   local cluster=nil
+   if allowClusters and hit.kind=="ball" and b and (not isAirborne(hit.a) or not isAirborne(b)) then
+    local same=flyer==nil
+    local within=(not same) and math.abs(hit.a.z-b.z)<=C.SoftContactMaxHopInches
+    if (same or within) and clusterTouches(state.balls,hit.a,b,ignored) then
+     cluster=clusterGather(state.balls,hit.a,b,state.geometry,ignored,flyer)
+    end
+   end
+   if cluster and b then
+    local flat=nil
+    if flyer then
+     local other=b
+     if flyer~=hit.a then other=hit.a end
+     flat=layFlat(flyer,other,cluster)
+    end
+    local ox,oy=b.x-hit.a.x,b.y-hit.a.y
+    local d=math.sqrt(ox*ox+oy*oy)
+    local imp=0
+    if d>1e-12 then imp=((hit.a.vx-b.vx)*ox+(hit.a.vy-b.vy)*oy)/d end
+    if imp>0 then noteHit(state,hit.a,b) end
+    local dur=resolveContacts(cluster,hit.a,b)
+    if flat then liftFlyer(flat) end
+    local ign={}
+    for _,x in ipairs(cluster) do ign[x]=true end
+    advance(state,dur,ign,false)
+    unused=unused-dur
+   else
+    pushOut(hit)
+    if hit.kind=="ball" and b then
+     if resolveBalls(hit.a,b)>0 then noteHit(state,hit.a,b) end
+    else
+     local inc=-(hit.a.vx*hit.nx+hit.a.vy*hit.ny)
+     resolveRail(hit.a,hit.nx,hit.ny,railRestitution(inc),C.RailFriction)
+    end
+   end
+   remaining=unused
+   if hit.t<=C.InstantHitSeconds then
+    local c=(instant[hit.a] or 0)+1
+    instant[hit.a]=c
+    if C.MaxInstantHits<=c then stopBall(hit.a) if b then stopBall(b) end end
+   end
+   if C.MaxEventsPerStep<=count then stopBall(hit.a) if b then stopBall(b) end end
+  end
+ end
+ return remaining
+end
+local function isAtRest(state)
+ for _,b in ipairs(state.balls) do
+  if isMoving(b) or (not b.pocketed and pocketAt(state.geometry,b.x,b.y)~=nil) then return false end
+ end
+ return true
+end
+
+local function firstContact(balls,ox,oy,dx,dy,excluded,pockets)
+ local R=C.R
+ local best,hitId=1e6,nil
+ local found=false
+ if pockets then
+  for _,p in ipairs(GEO.pockets) do
+   local t=pointTOI(ox,oy,dx,dy,0,p.x,p.y,p.radius,best)
+   if t and t<best then best=t hitId=nil found=true end
+  end
+ end
+ for _,b in ipairs(balls) do
+  if b.id~=0 and b.id~=excluded then
+   local t=circleTOI(ox,oy,dx,dy,b.x,b.y,0,0,R,best)
+   if t and t<best then best=t hitId=b.id found=true end
+  end
+ end
+ for _,s in ipairs(GEO.segments) do
+  local t=segmentTOI(ox,oy,dx,dy,R,s,best)
+  if t and t<best then best=t hitId=nil found=true end
+ end
+ for _,p in ipairs(GEO.points) do
+  local t=pointTOI(ox,oy,dx,dy,R,p.x,p.y,p.radius,best)
+  if t and t<best then best=t hitId=nil found=true end
+ end
+ if not found then return nil end
+ return best,hitId
+end
+
+local function simulate(input,power,doYield)
+ local balls,recs,byId={},{},{}
+ local cue=nil
+ for i,s in ipairs(input.balls) do
+  local b=newBall(s.id,s.x,s.y)
+  balls[i]=b
+  if b.id==0 then cue=b end
+ end
+ if not cue then return nil end
+ local state={time=0,geometry=GEO,balls=balls}
+ strike(cue,{angle=input.angle,power=power,spin=input.spin,elevation=input.elevation})
+ for i,b in ipairs(balls) do recs[i]={L={x=b.x,y=b.y},P={x=b.x,y=b.y},paths={},moved=false} end
+ local contacted=false
+ local maxSteps=math.floor(C.MaxShotSeconds/C.FixedStep)
+ local steps,capped=0,false
+ local sliceStart=doYield and tick() or 0
+ while true do
+  if isAtRest(state) then break end
+  if steps>=maxSteps then capped=true break end
+  advance(state,C.FixedStep,nil,true)
+  steps=steps+1
+  if state.first and not contacted then
+   contacted=true
+   for i,b in ipairs(balls) do
+    if b==cue then
+     local r=recs[i]
+     local c=state.contact
+     r.paths[#r.paths+1]={a=r.L,b={x=c.x,y=c.y},afterContact=false}
+     r.L={x=c.x,y=c.y} r.P={x=c.x,y=c.y} r.moved=true
+    end
+   end
+  end
+  for i,b in ipairs(balls) do
+   local r=recs[i]
+   local cx,cy=b.x,b.y
+   local mx,my=cx-r.P.x,cy-r.P.y
+   local m2=mx*mx+my*my
+   if m2>1e-10 then
+    r.moved=true
+    local lx,ly=r.P.x-r.L.x,r.P.y-r.L.y
+    local l2=lx*lx+ly*ly
+    if l2>0.0025 then
+     local cr=lx*my-ly*mx
+     local dt=lx*mx+ly*my
+     if dt<=0 or math.abs(cr)>0.02*math.sqrt(l2*m2) then
+      r.paths[#r.paths+1]={a=r.L,b={x=r.P.x,y=r.P.y},afterContact=state.first~=nil}
+      r.L={x=r.P.x,y=r.P.y}
+     end
+    end
+    r.P={x=cx,y=cy}
+   end
+  end
+  if doYield and steps%8==0 and tick()-sliceStart>SIM_SLICE then
+   task.wait()
+   sliceStart=tick()
+   if not H.Running or not H.CurrentInput or H.CurrentInput.ballsKey~=input.ballsKey then return nil end
+  end
+ end
+ local out={balls={},byId={},settled=not capped,firstContact=state.first,contact=state.contact,steps=steps,duration=state.time}
+ for i,b in ipairs(balls) do
+  local r=recs[i]
+  local dx,dy=r.P.x-r.L.x,r.P.y-r.L.y
+  if dx*dx+dy*dy>0.0004 then r.paths[#r.paths+1]={a=r.L,b={x=r.P.x,y=r.P.y},afterContact=state.first~=nil} end
+  local o={id=b.id,p={x=b.x,y=b.y},r=C.R,pocketed=b.pocketed,offTable=b.offTable,moved=r.moved,paths=r.paths}
+  out.balls[#out.balls+1]=o
+  out.byId[b.id]=o
+ end
+ return out
+end
+H.Simulate=simulate
+H.FirstContact=firstContact
+local PHYSICS_END=true
+
+local RS=game:GetService("RunService")
+local UIS=game:GetService("UserInputService")
+local Players=game:GetService("Players")
+local function finite(n) return type(n)=="number" and n==n and n>-1e7 and n<1e7 end
+local function V(x,y) return {x=x,y=y} end
+local function add(a,b) return V(a.x+b.x,a.y+b.y) end
+local function mul(a,s) return V(a.x*s,a.y*s) end
+
+local function lowestBall(balls)
+ local lowest=nil
+ for _,b in ipairs(balls) do
+  if not b.pocketed and b.id>=1 and b.id<=15 and (not lowest or b.id<lowest) then lowest=b.id end
+ end
+ return lowest
+end
+local function eightIsReady(balls,group)
+ if group~="Solid" and group~="Stripe" then return false end
+ for _,b in ipairs(balls) do
+  if not b.pocketed and ((group=="Solid" and b.id>=1 and b.id<=7) or (group=="Stripe" and b.id>=9 and b.id<=15)) then return false end
+ end
+ return true
+end
+local function showBallPreview(ball,primary,extras,ready)
+ return ball.moved and (ball.id==0 or ball.id==primary or extras or (ball.id==8 and ready==false))
+end
+local function ballSide(id,group,ready)
+ if group=="NineBall" then return id and id>=1 and id<=15 and "Own" or nil end
+ if group~="Solid" and group~="Stripe" then return nil end
+ if id==8 then return ready and "Own" or nil end
+ if id==0 or not id or id<1 or id>15 then return nil end
+ local own=(group=="Solid" and id<=7) or (group=="Stripe" and id>=9)
+ return own and "Own" or "Opponent"
+end
+local function safePocket(result,id,group,ready,lowest)
+ local ball=result.byId[id]
+ local white=result.byId[0]
+ local eight=result.byId[8]
+ if group=="NineBall" then
+  return ball~=nil and ball.pocketed and result.settled and lowest~=nil and result.firstContact==lowest and not (white and white.pocketed)
+ end
+ return ball~=nil and ball.pocketed and result.settled and ballSide(id,group,ready)=="Own"
+  and ballSide(result.firstContact,group,ready)=="Own"
+  and not (white and white.pocketed) and not (eight and eight.pocketed and not ready)
+end
+
+local yellow=Color3.fromRGB(255,220,30)
+local cyan=Color3.fromRGB(90,220,255)
+local whiteColor=Color3.fromRGB(245,245,245)
+local red=Color3.fromRGB(255,70,70)
+local green=Color3.fromRGB(90,245,130)
+local pink=Color3.fromRGB(255,105,180)
+local neutral=Color3.fromRGB(190,190,190)
+local function pathColor(id,group,ready)
+ if id==0 then return whiteColor end
+ if group=="NineBall" then return id==9 and green or pink end
+ if id==8 then return ready and green or red end
+ if group~="Solid" and group~="Stripe" then return neutral end
+ local own=(group=="Solid" and id>=1 and id<=7) or (group=="Stripe" and id>=9 and id<=15)
+ return own and pink or cyan
+end
+local function markerColor(ball,primary,group,ready,extras)
+ if ball.id==0 then return ball.pocketed and red or whiteColor end
+ if ball.id==8 then return pathColor(8,group,ready) end
+ local side=ballSide(ball.id,group,ready)
+ if side=="Opponent" and ball.pocketed then return red end
+ if ball.id==primary then return yellow end
+ if extras and side=="Own" then return pink end
+ if extras and side=="Opponent" then return cyan end
+ if not side then return neutral end
+ return ball.pocketed and green or cyan
+end
+
+local lines,extraLines,markers,connections={},{},{},{}
+for i=1,64 do
+ local l=Drawing.new("Line")
+ l.Color=yellow l.Thickness=2 l.Visible=false l.ZIndex=90 lines[i]=l
+end
+for i=1,128 do
+ local l=Drawing.new("Line")
+ l.Color=cyan l.Thickness=1.5 l.Visible=false l.ZIndex=89 extraLines[i]=l
+end
+for id=0,15 do
+ local c=Drawing.new("Circle")
+ c.Color=id==0 and whiteColor or cyan c.Thickness=2 c.NumSides=40
+ c.Filled=id~=0 c.Transparency=id==0 and 0 or 0.35 c.Visible=false c.ZIndex=91
+ markers[id+1]=c
+end
+local ghost=Drawing.new("Circle")
+ghost.Color=yellow ghost.Thickness=2 ghost.NumSides=40 ghost.Filled=false ghost.Visible=false ghost.ZIndex=91
+local label=Drawing.new("Text")
+label.Color=yellow label.Size=16 label.Outline=true label.Font=1
+label.Position=Vector2.new(20,100) label.Visible=true label.ZIndex=92
+label.Text="Loading pool preview... | X toggle | Hold O: remove"
+local function newBadge(color)
+ local ring=Drawing.new("Circle")
+ ring.Color=color ring.Thickness=2 ring.NumSides=40 ring.Filled=false ring.Visible=false ring.ZIndex=93
+ local text=Drawing.new("Text")
+ text.Color=color text.Size=15 text.Font=1 text.Outline=true text.Center=true text.Visible=false text.ZIndex=94
+ return {ring=ring,text=text}
+end
+local warningDrawings={eight=newBadge(red),white=newBadge(red)}
+local pocketDrawings={}
+for id=1,15 do pocketDrawings[id]=newBadge(green) end
+
+local shown,wasShown={},{}
+local function show(d) d.Visible=true shown[d]=true end
+local function endFrame()
+ for d in pairs(wasShown) do if not shown[d] then d.Visible=false end end
+ wasShown=shown shown={}
+end
+local function hideAll()
+ for d in pairs(wasShown) do pcall(function() d.Visible=false end) end
+ for d in pairs(shown) do pcall(function() d.Visible=false end) end
+ shown={} wasShown={}
+end
+local function remove(d) pcall(function() d:Remove() end) end
+function H.Stop()
+ if not H.Running then return end
+ H.Running=false
+ for _,c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+ for _,l in ipairs(lines) do remove(l) end
+ for _,l in ipairs(extraLines) do remove(l) end
+ for _,c in ipairs(markers) do remove(c) end
+ remove(ghost) remove(label)
+ for _,w in pairs(warningDrawings) do remove(w.ring) remove(w.text) end
+ for _,w in pairs(pocketDrawings) do remove(w.ring) remove(w.text) end
+end
+
+local F={ok=false,cx=0,cz=0,rx=1,rz=0,lx=0,lz=-1,planeY=3.094,vw=1920,vh=1080}
+local bound={}
+local function isPart(i) local c=i.ClassName return c=="MeshPart" or c=="Part" end
+local function mirrorY() return MIRROR and -1 or 1 end
+local function toGame(p)
+ local dx,dz=p.X-F.cx,p.Z-F.cz
+ return (dx*F.rx+dz*F.rz)/STUDS_PER_INCH,(dx*F.lx+dz*F.lz)/STUDS_PER_INCH*mirrorY()
+end
+local function world(x,y)
+ local s=STUDS_PER_INCH
+ local yy=y*mirrorY()
+ return Vector3.new(F.cx+(F.rx*x+F.lx*yy)*s,F.planeY,F.cz+(F.rz*x+F.lz*yy)*s)
+end
+local function findGuiNumber(root)
+ if not root then return nil end
+ local list={root}
+ for _,d in ipairs(root:GetDescendants()) do list[#list+1]=d end
+ local fallback=nil
+ for _,d in ipairs(list) do
+  local ok,t=pcall(function() return d.Text end)
+  if ok and type(t)=="string" and t:match("%d") then
+   if t:match("%%") then return d end
+   fallback=fallback or d
+  end
+ end
+ return fallback
+end
+local function findNamed(root,pattern)
+ if not root then return nil end
+ for _,d in ipairs(root:GetDescendants()) do
+  if d.Name:lower():find(pattern) then return d end
+ end
+ return nil
+end
+local function bindScene()
+ local cv=workspace:FindFirstChild("ClientVisuals")
+ local holder=cv and cv:FindFirstChild("Balls")
+ local set,setD=nil,INF
+ local cam=workspace.CurrentCamera
+ local cp=cam and cam.CFrame and cam.CFrame.Position
+ if holder then
+  for _,f in ipairs(holder:GetChildren()) do
+   local cb=f:FindFirstChild("CueBall")
+   local p=cb and cb.Position
+   if p then
+    local d=0
+    if cp then d=(p.X-cp.X)^2+(p.Y-cp.Y)^2+(p.Z-cp.Z)^2 end
+    if d<setD then set=f setD=d end
+   end
+  end
+ end
+ bound.set=set
+ local parts={}
+ if set then
+  for _,c in ipairs(set:GetChildren()) do
+   local id=nil
+   if c.Name=="CueBall" then id=0 else id=tonumber(c.Name:match("^Ball(%d+)$")) end
+   if id and id<=15 then parts[#parts+1]={id=id,part=c} end
+  end
+ end
+ bound.balls=parts
+ local suffix=set and set.Name:match("_(%d+)$")
+ local tables=workspace:FindFirstChild("Tables")
+ local tbl=tables and suffix and tables:FindFirstChild("Table_"..suffix)
+ local cloth=tbl and tbl:FindFirstChild("Cloth")
+ if cloth then
+  local p=cloth.Position
+  local cf=cloth.CFrame
+  if p then
+   F.cx,F.cz=p.X,p.Z
+   local r=cf and cf.RightVector
+   local l=cf and cf.LookVector
+   if r and l and finite(r.X) and finite(l.X) then
+    local rl=math.sqrt(r.X*r.X+r.Z*r.Z)
+    local ll=math.sqrt(l.X*l.X+l.Z*l.Z)
+    if rl>0.5 and ll>0.5 then F.rx,F.rz,F.lx,F.lz=r.X/rl,r.Z/rl,l.X/ll,l.Z/ll end
+   end
+   F.ok=true
+  end
+ else F.ok=false end
+ H.Stats.table=tbl and tbl.Name or "missing"
+ local gl=cv and cv:FindFirstChild("Guideline")
+ local pts={}
+ if gl then
+  for _,d in ipairs(gl:GetDescendants()) do
+   if d.ClassName=="Attachment" or isPart(d) then pts[#pts+1]=d end
+  end
+ end
+ bound.guidePoints=pts
+ local stick=cv and cv:FindFirstChild("CueStick")
+ local addr=stick and stick.Address
+ if addr~=bound.stickAddress or tick()-(bound.stickTime or 0)>2 then
+  bound.stickAddress=addr bound.stickTime=tick()
+  local best,size=nil,0
+  if stick then
+   for _,d in ipairs(stick:GetDescendants()) do
+    if isPart(d) then
+     local s=d.Size
+     if s then
+      local m=math.max(s.X,s.Y,s.Z)
+      if m>size then best=d size=m end
+     end
+    end
+   end
+  end
+  bound.cuePart=best
+ end
+ local lp=Players.LocalPlayer
+ local pg=lp and lp:FindFirstChild("PlayerGui")
+ local hud=pg and pg:FindFirstChild("PoolHud")
+ bound.hud=hud
+ local selector=hud and hud:FindFirstChild("SpinSelector")
+ local toggle=selector and selector:FindFirstChild("SpinToggle")
+ bound.elevation=toggle and toggle:FindFirstChild("CueAngle")
+ local dot=findNamed(toggle,"dot") or findNamed(selector,"dot")
+ if not dot then
+  local function scan(root)
+   if not root then return nil end
+   for _,d in ipairs(root:GetDescendants()) do
+    local ok,good=pcall(function()
+     local ds,ps=d.AbsoluteSize,d.Parent.AbsoluteSize
+     return ds.X>2 and math.abs(ds.X-ds.Y)<2 and math.abs(ps.X-ps.Y)<2 and ps.X>ds.X*2.5 and ps.X<ds.X*14
+    end)
+    if ok and good then return d end
+   end
+   return nil
+  end
+  dot=scan(toggle) or scan(selector)
+ end
+ bound.spinDot=dot
+ bound.spinBall=dot and dot.Parent
+ local bar=hud and hud:FindFirstChild("PowerBar")
+ bound.powerBar=bar
+ bound.powerLabel=findGuiNumber(bar)
+ bound.powerFill=findNamed(bar,"fill")
+end
+H.Bind=bindScene
+task.spawn(function()
+ while H.Running do
+  local ok,err=pcall(bindScene)
+  H.Stats.bindError=not ok and tostring(err) or nil
+  task.wait(0.4)
+ end
+end)
+
+local function readPower(gap)
+ local l=bound.powerLabel
+ if l then
+  local ok,t=pcall(function() return l.Text end)
+  local n=ok and type(t)=="string" and tonumber(t:match("([%d%.]+)")) or nil
+  if n and finite(n) then
+   if n>1.0001 then n=n/100 end
+   H.Stats.powerSource="label" return clamp(n,0,1)
+  end
+ end
+ local f=bound.powerFill
+ if f then
+  local ok,s=pcall(function() return f.Size end)
+  if ok and s then
+   local v=math.max(s.X.Scale,s.Y.Scale)
+   if finite(v) and v>=0 and v<=1.0001 then H.Stats.powerSource="fill" return clamp(v,0,1) end
+  end
+ end
+ if gap and finite(gap) then
+  local v=(gap-2.5*STUDS_PER_INCH)/1.3
+  if v>-0.1 and v<1.15 then H.Stats.powerSource="pullback" return clamp(v,0,1) end
+ end
+ H.Stats.powerSource="unknown"
+ return nil
+end
+local function readElevation()
+ local l=bound.elevation
+ local ok,t=pcall(function() return l.Text end)
+ local n=ok and type(t)=="string" and tonumber(t:match("([%d%.]+)")) or nil
+ if n and finite(n) then return clamp(n,C.CueElevation,C.MaxElevation) end
+ return C.CueElevation
+end
+local function readSpin()
+ local d,b=bound.spinDot,bound.spinBall
+ if not d or not b then H.Stats.spinSource="missing" return V(0,0) end
+ local ok,res=pcall(function()
+  local dp,ds,bp,bs=d.AbsolutePosition,d.AbsoluteSize,b.AbsolutePosition,b.AbsoluteSize
+  local r=bs.X/2
+  if r<=1 then return nil end
+  local sx=((dp.X+ds.X/2)-(bp.X+bs.X/2))/r
+  local sy=-((dp.Y+ds.Y/2)-(bp.Y+bs.Y/2))/r
+  if not finite(sx) or not finite(sy) then return nil end
+  return V(sx,sy)
+ end)
+ if ok and res then H.Stats.spinSource="dot" return res end
+ H.Stats.spinSource="unreadable"
+ return V(0,0)
+end
+local function readAim(cue)
+ local part=bound.cuePart
+ if not part then return nil,"no cue stick" end
+ local ok,res,why=pcall(function()
+  local t=part.Transparency
+  if finite(t) and t>0.99 then return nil,"cue hidden" end
+  local s,cf,p=part.Size,part.CFrame,part.Position
+  if not s or not cf or not p then return nil,"cue unreadable" end
+  local axis
+  if s.X>=s.Y and s.X>=s.Z then axis=cf.RightVector elseif s.Y>=s.Z then axis=cf.UpVector else axis=cf.LookVector end
+  local ax=(axis.X*F.rx+axis.Z*F.rz)
+  local ay=(axis.X*F.lx+axis.Z*F.lz)*mirrorY()
+  local al=math.sqrt(ax*ax+ay*ay)
+  if al<0.3 then return nil,"cue vertical" end
+  ax,ay=ax/al,ay/al
+  local px,py=toGame(p)
+  local flip=(cue.x-px)*ax+(cue.y-py)*ay<0
+  if flip then ax,ay=-ax,-ay end
+  local len=math.max(s.X,s.Y,s.Z)
+  local gap=nil
+  if len>5.5 and len<8.5 then
+   local k=flip and -1 or 1
+   local tx,ty,tz=p.X+axis.X*k*len/2,p.Y+axis.Y*k*len/2,p.Z+axis.Z*k*len/2
+   local cw=world(cue.x,cue.y)
+   local d=math.sqrt((tx-cw.X)^2+(ty-cw.Y)^2+(tz-cw.Z)^2)
+   gap=d-1.215*STUDS_PER_INCH
+  end
+  return V(ax,ay),gap
+ end)
+ if not ok then return nil,tostring(res) end
+ return res,why
+end
+
+local function refineAim(cue,dir,balls)
+ local pts=bound.guidePoints
+ if not pts or #pts==0 then return dir,"cue" end
+ local reach=firstContact(balls,cue.x,cue.y,dir.x,dir.y)
+ local maxF=(reach or 100)+2.5
+ local bx,by,bf=nil,nil,0
+ for _,inst in ipairs(pts) do
+  local ok,p=pcall(function()
+   if inst.ClassName=="Attachment" then return inst.WorldPosition end
+   local t=inst.Transparency
+   if finite(t) and t>0.99 then return nil end
+   return inst.Position
+  end)
+  if ok and p and finite(p.X) and finite(p.Z) then
+   local x,y=toGame(p)
+   local rx,ry=x-cue.x,y-cue.y
+   local f=rx*dir.x+ry*dir.y
+   local lat=math.abs(rx*dir.y-ry*dir.x)
+   if f>3 and f<=maxF and lat<0.6 and f>bf then bx,by,bf=rx,ry,f end
+  end
+ end
+ if bx then
+  local l=math.sqrt(bx*bx+by*by)
+  return V(bx/l,by/l),"guide"
+ end
+ return dir,"cue"
+end
+local currentBalls={}
+local latest,preview,guideCache=nil,nil,nil
+local previous={}
+local quietAt=0
+local ownGroup="Unknown"
+local function resolveGroup(balls)
+ return H.Group
+end
+local function snapshot()
+ local st=H.Stats
+ latest=nil
+ st.previewStatus="Waiting for pool table"
+ if not H.Enabled then currentBalls={} return end
+ local cam=workspace.CurrentCamera
+ local vp=cam and cam.ViewportSize
+ F.vw=vp and finite(vp.X) and vp.X>0 and vp.X or 1920
+ F.vh=vp and finite(vp.Y) and vp.Y>0 and vp.Y or 1080
+ if not F.ok or not bound.balls or #bound.balls==0 then H.Waiting=true currentBalls={} return end
+ local raw,ys={},{}
+ for _,e in ipairs(bound.balls) do
+  local part=e.part
+  local ok,p,t=pcall(function() return part.Position,part.Transparency end)
+  if ok and p and finite(p.X) and finite(p.Y) and finite(p.Z) and not (finite(t) and t>0.99) then
+   local x,y=toGame(p)
+   raw[#raw+1]={id=e.id,x=x,y=y,wy=p.Y}
+   ys[#ys+1]=p.Y
+  end
+ end
+ if #raw==0 then H.Waiting=true currentBalls={} st.previewStatus="No balls" return end
+ table.sort(ys)
+ local plane=ys[math.floor((#ys+1)/2)]
+ F.planeY=plane
+ local balls={}
+ for _,b in ipairs(raw) do
+  if math.abs(b.wy-plane)<0.15 and containsCenter(GEO,b.x,b.y,0) and not pocketAt(GEO,b.x,b.y) then
+   balls[#balls+1]={id=b.id,x=b.x,y=b.y,p=V(b.x,b.y),r=C.R}
+  end
+ end
+ table.sort(balls,function(a,b) return a.id<b.id end)
+ H.Waiting=false
+ currentBalls=balls
+ ownGroup=resolveGroup(balls)
+ st.ballCount=#balls
+ local white,moved=nil,false
+ for _,b in ipairs(balls) do
+  if b.id==0 then white=b end
+  local last=previous[b.id]
+  if last and ((b.x-last.x)^2+(b.y-last.y)^2)>0.0025 then moved=true end
+  previous[b.id]=V(b.x,b.y)
+ end
+ if moved then quietAt=tick()+0.18 end
+ if not white then st.previewStatus="Cue ball not on table" return end
+ if tick()<quietAt then st.previewStatus="Balls moving" return end
+ local dir,why=readAim(white)
+ if not dir then st.previewStatus="Aim: "..tostring(why or "unavailable") return end
+ local power=readPower(why)
+ st.powerPercent=power and math.floor(power*100+0.5) or nil
+ if power and power>=0.05 then
+  power=math.floor(power*50+0.5)/50
+  st.powerMode="live"
+ else
+  power=1
+  st.powerMode="max"
+ end
+ power=clamp(power,C.MinPowerToShoot,1)
+ local spin=readSpin()
+ local sx,sy=clampSpin(spin.x,spin.y)
+ spin=V(sx*mirrorY(),sy)
+ local elevation=readElevation()
+ st.spinX=sx st.spinY=sy st.elevation=elevation
+ dir,st.aimSource=refineAim(white,dir,balls)
+ local angle=atan2(dir.y,dir.x)
+ local parts={tostring(bound.set and bound.set.Name)}
+ for _,b in ipairs(balls) do parts[#parts+1]=string.format("%d:%.3f,%.3f",b.id,b.x,b.y) end
+ local ballsKey=table.concat(parts,"|")
+ local shotKey=string.format("%.3f,%.3f:%.1f:%.2f",spin.x,spin.y,elevation,power)
+ local base=ballsKey.."|"..shotKey.."|"..string.format("%.6f",angle)
+ latest={balls=balls,angle=angle,dir=dir,spin=spin,elevation=elevation,power=power,ballsKey=ballsKey,shotKey=shotKey,base=base,key=base}
+ st.previewStatus="Computing preview"
+end
+
+local lastDump=0
+function H.Dump(reason)
+ local rows={"Lucky 8 helper diagnostics","version="..H.Version,"reason="..tostring(reason or "manual"),string.format("clock=%.1f",tick())}
+ local keys={}
+ for k in pairs(H.Stats) do keys[#keys+1]=k end
+ table.sort(keys)
+ for _,k in ipairs(keys) do rows[#rows+1]=k.."="..tostring(H.Stats[k]) end
+ local function path(i) local t={} while i and i~=game do table.insert(t,1,i.Name) i=i.Parent end return table.concat(t,".") end
+ local function dumpTree(root)
+  if not root then return end
+  local list={root}
+  for _,d in ipairs(root:GetDescendants()) do list[#list+1]=d end
+  for _,d in ipairs(list) do
+   local s=path(d).." ["..d.ClassName.."]"
+   pcall(function() local v=d.Text if type(v)=="string" then s=s.." text="..v end end)
+   pcall(function() local a,z=d.AbsolutePosition,d.AbsoluteSize if a and z then s=s..string.format(" abs=%.0f,%.0f size=%.0f,%.0f",a.X,a.Y,z.X,z.Y) end end)
+   pcall(function() local z=d.Size if z and z.X and type(z.X)=="number" then s=s..string.format(" part=%.3f,%.3f,%.3f",z.X,z.Y,z.Z) end end)
+   rows[#rows+1]=s
+   if #rows>1200 then break end
+  end
+ end
+ local cv=workspace:FindFirstChild("ClientVisuals")
+ local hud=bound.hud
+ pcall(dumpTree,hud and hud:FindFirstChild("SpinSelector"))
+ pcall(dumpTree,hud and hud:FindFirstChild("PowerBar"))
+ pcall(dumpTree,cv and cv:FindFirstChild("CueStick"))
+ pcall(dumpTree,cv and cv:FindFirstChild("Guideline"))
+ pcall(function()
+  local g=getgc({"elevation","spin","angle","power"})
+  for i=1,math.min(#g,80) do
+   local e=g[i]
+   rows[#rows+1]=string.format("gc %s=%s (%s)",tostring(e.key),tostring(e.value),tostring(e.type))
+  end
+ end)
+ local ok,err=pcall(writefile,"lucky8_diag.txt",table.concat(rows,"\n"))
+ H.Stats.lastDump=ok and "lucky8_diag.txt" or ("dump failed: "..tostring(err))
+ pcall(notify,ok and "Saved lucky8_diag.txt" or ("Dump failed: "..tostring(err)),"Pool helper",4)
+ return ok
+end
+local function autoDump(reason)
+ if tick()-lastDump<15 then return end
+ lastDump=tick() H.Dump(reason)
+end
+
+task.spawn(function()
+ while H.Running do
+  local input=latest
+  if H.Enabled and input and (not preview or preview.key~=input.key) then
+   local start=tick()
+   local ok,err=pcall(function()
+    local actual=simulate(input,input.power,true)
+    if actual and H.Running then
+     preview={key=input.key,base=input.base,ballsKey=input.ballsKey,shotKey=input.shotKey,angle=input.angle,guide=actual,actual=actual}
+     H.Stats.computeMs=math.floor((tick()-start)*1000)
+     H.Stats.simSteps=actual.steps
+     H.Stats.settled=actual.settled
+     H.Stats.target=actual.firstContact
+    end
+   end)
+   H.Stats.simulationError=not ok and tostring(err) or nil
+   if not ok then autoDump("simulation: "..tostring(err)) end
+  end
+  task.wait(0.015)
+ end
+end)
+
+local function sanePoint(x,y)
+ return finite(x) and finite(y) and x>-F.vw and x<F.vw*2 and y>-F.vh and y<F.vh*2
+end
+local function toScreen(p)
+ local s,visible=WorldToScreen(world(p.x,p.y))
+ if visible and s and sanePoint(s.X,s.Y) then return s.X,s.Y end
+ return nil
+end
+local function drawLine(line,seg,color)
+ local ax,ay=toScreen(seg.a)
+ if not ax then return false end
+ local bx,by=toScreen(seg.b)
+ if not bx then return false end
+ line.Color=color line.From=Vector2.new(ax,ay) line.To=Vector2.new(bx,by) show(line)
+ return true
+end
+local function project(ball)
+ local x,y=toScreen(ball.p)
+ if not x then return nil end
+ local qx,qy=toScreen(add(ball.p,V(ball.r,0)))
+ if not qx then return nil end
+ local radius=math.sqrt((qx-x)^2+(qy-y)^2)
+ if not finite(radius) then return nil end
+ return Vector2.new(x,y),clamp(radius,1,400)
+end
+local function drawCircle(circle,ball,color)
+ local p,radius=project(ball)
+ if not p then return false end
+ circle.Position=p circle.Radius=math.max(3,radius) circle.Color=color show(circle)
+ return true
+end
+local function drawBadge(drawing,ball,message,color)
+ local p,radius=project(ball)
+ if not p then return false end
+ radius=math.max(5,radius+3)
+ if color then drawing.ring.Color=color drawing.text.Color=color end
+ drawing.ring.Position=p drawing.ring.Radius=radius show(drawing.ring)
+ drawing.text.Position=Vector2.new(p.X,p.Y-radius-20)
+ drawing.text.Text=message show(drawing.text)
+ return true
+end
+
+local KEY_X,KEY_O,KEY_SPACE,KEY_F7,KEY_G=Enum.KeyCode.X.Value,Enum.KeyCode.O.Value,Enum.KeyCode.Space.Value,Enum.KeyCode.F7.Value,Enum.KeyCode.H.Value
+local GROUPS={"Unknown","Solid","Stripe"}
+local held={}
+local removeAt=nil
+local function handleKey(key)
+ if held[key] then return end
+ held[key]=true
+ if key==KEY_X then H.Enabled=not H.Enabled
+ elseif key==KEY_SPACE then H.ShowCollisions=not H.ShowCollisions
+ elseif key==KEY_F7 then H.Dump("F7")
+ elseif key==KEY_G then
+  local i=1
+  for n,g in ipairs(GROUPS) do if g==H.Group then i=n end end
+  H.Group=GROUPS[i%#GROUPS+1]
+ elseif key==KEY_O then removeAt=tick()+REMOVE_HOLD end
+end
+local function releaseKey(key)
+ held[key]=nil
+ if key==KEY_O then removeAt=nil end
+end
+local VK={[0x58]=KEY_X,[0x4F]=KEY_O,[0x20]=KEY_SPACE,[0x76]=KEY_F7,[0x48]=KEY_G}
+task.spawn(function()
+ local was={}
+ while H.Running do
+  for vk,key in pairs(VK) do
+   local ok,down=pcall(iskeypressed,vk)
+   down=ok and down==true
+   if down and not was[vk] then pcall(handleKey,key) end
+   if not down and was[vk] then pcall(releaseKey,key) end
+   was[vk]=down
+  end
+  task.wait(0.03)
+ end
+end)
+
+local lastLabel=nil
+local function setLabel(text)
+ if #text>LABEL_MAX then text=text:sub(1,LABEL_MAX-3).."..." end
+ if text~=lastLabel then label.Text=text lastLabel=text end
+end
+local function instantLines(input)
+ local white=nil
+ for _,b in ipairs(input.balls) do if b.id==0 then white=b break end end
+ if not white then return nil end
+ local dx,dy=input.dir.x,input.dir.y
+ local d,target=firstContact(input.balls,white.x,white.y,dx,dy)
+ if not d then return nil end
+ local gx,gy=white.x+dx*d,white.y+dy*d
+ local out={cue={a=V(white.x,white.y),b=V(gx,gy)},ghost=V(gx,gy),target=target}
+ local obj=nil
+ if target then for _,b in ipairs(input.balls) do if b.id==target then obj=b end end end
+ if obj then
+  local ox,oy=obj.x-gx,obj.y-gy
+  local ol=math.sqrt(ox*ox+oy*oy)
+  if ol>1e-9 then ox,oy=ox/ol,oy/ol end
+  local od=firstContact(input.balls,obj.x+ox*0.001,obj.y+oy*0.001,ox,oy,target,true)
+  if od then out.object={a=V(obj.x,obj.y),b=V(obj.x+ox*od,obj.y+oy*od)} end
+  local sh=dx*ox+dy*oy
+  local cx,cy=dx-sh*ox,dy-sh*oy
+  local cl=math.sqrt(cx*cx+cy*cy)
+  if cl>=0.001 then
+   cx,cy=cx/cl,cy/cl
+   local cd=firstContact(input.balls,gx+cx*0.001,gy+cy*0.001,cx,cy,target,true)
+   if cd then out.after={a=V(gx,gy),b=V(gx+cx*cd,gy+cy*cd)} end
+  end
+ end
+ return out
+end
+local function isFresh(p,l)
+ if not p or not l or p.ballsKey~=l.ballsKey or p.shotKey~=l.shotKey then return false end
+ local d=math.abs(p.angle-l.angle)
+ if d>math.pi then d=2*math.pi-d end
+ return d<0.0035
+end
+local function render()
+ snapshot()
+ H.CurrentInput=latest
+ local mainCount,extraCount=0,0
+ local ready=eightIsReady(currentBalls,ownGroup)
+ local nine=ownGroup=="NineBall"
+ local lowest=nine and lowestBall(currentBalls) or nil
+ local eightRisk=not nine and not ready
+ local fresh=H.Enabled and isFresh(preview,latest)
+ if fresh then
+  H.Stats.previewStatus="Ready"
+  local guide,actual=preview.guide,preview.actual
+  local live={}
+  for _,ball in ipairs(currentBalls) do live[ball.id]=ball end
+  local primary=guide.firstContact
+  local eightDanger=primary==8 and eightRisk
+  local nineFoul=nine and primary~=nil and lowest~=nil and primary~=lowest
+  local mainColor=(eightDanger or nineFoul) and red or yellow
+  local function mainLine(s)
+   if mainCount<#lines then mainCount=mainCount+1 drawLine(lines[mainCount],s,mainColor) end
+  end
+  local cueGuide=guide.byId[0]
+  if cueGuide then for _,s in ipairs(cueGuide.paths) do if not s.afterContact then mainLine(s) end end end
+  local target=primary and guide.byId[primary]
+  if target then for _,s in ipairs(target.paths) do mainLine(s) end end
+  if guide.contact and not eightDanger and not nineFoul then drawCircle(ghost,{p=guide.contact,r=C.R},yellow) end
+  local white=actual.byId[0]
+  if white and white.pocketed and live[0] then drawBadge(warningDrawings.white,live[0],"WARNING") end
+  local eight=actual.byId[8]
+  if eight and eight.pocketed and eightRisk and live[8] then drawBadge(warningDrawings.eight,live[8],"WARNING") end
+  for _,ball in ipairs(currentBalls) do
+   local predicted=actual.byId[ball.id]
+   if ball.id~=0 and predicted and predicted.pocketed and pocketDrawings[ball.id] then
+    if safePocket(actual,ball.id,ownGroup,ready,lowest) then drawBadge(pocketDrawings[ball.id],ball,"SAFE",green)
+    elseif ballSide(ball.id,ownGroup,ready)=="Opponent" then drawBadge(pocketDrawings[ball.id],ball,"!",cyan) end
+   end
+  end
+  for _,ball in ipairs(actual.balls) do
+   if markers[ball.id+1] and not ball.offTable and showBallPreview(ball,primary,H.ShowCollisions,not eightRisk) then
+    drawCircle(markers[ball.id+1],ball,markerColor(ball,primary,ownGroup,ready,H.ShowCollisions))
+   end
+  end
+  for _,ball in ipairs(actual.balls) do
+   if ball.id~=0 and ball.moved and ball.id~=primary and (H.ShowCollisions or (ball.id==8 and eightRisk)) then
+    local color=pathColor(ball.id,ownGroup,ready)
+    for _,s in ipairs(ball.paths) do
+     if extraCount>=#extraLines then break end
+     extraCount=extraCount+1
+     drawLine(extraLines[extraCount],s,color)
+    end
+   end
+  end
+ end
+ if H.Enabled and latest and not fresh then
+  local g=instantLines(latest)
+  if g then
+   local target=g.target
+   local danger=(target==8 and eightRisk) or (nine and target and lowest and target~=lowest)
+   local col=danger and red or yellow
+   drawLine(lines[1],g.cue,col)
+   if g.object then drawLine(lines[2],g.object,col) end
+   if g.after then drawLine(lines[3],g.after,whiteColor) end
+   if target and not danger then drawCircle(ghost,{p=g.ghost,r=C.R},yellow) end
+   H.Stats.previewStatus="Aiming"
+  end
+ end
+ endFrame()
+ local text
+ if H.Waiting then text="Waiting for pool table... | Hold O: remove"
+ elseif not H.Enabled then text="Preview paused | X resume | Hold O: remove"
+ else
+  local used=latest and math.floor(latest.power*100+0.5) or nil
+  text="Power "..tostring(used or "?").."%"..(H.Stats.powerMode=="max" and " (max)" or "").." ["..tostring(H.Stats.powerSource).."] | Aim: "..tostring(H.Stats.aimSource).." | Elev "..tostring(H.Stats.elevation or 4)
+  text=text..string.format(" | Spin %.2f,%.2f",H.Stats.spinX or 0,H.Stats.spinY or 0)..(H.Stats.spinSource~="dot" and " ["..tostring(H.Stats.spinSource).."]" or "")
+  text=text.." | Group: "..ownGroup.." (H)"
+  text=text.." | SPACE extra "..(H.ShowCollisions and "ON" or "OFF").." | X toggle | Hold O: remove"
+  if nine then text=text.." | 9-Ball: hit "..(lowest and tostring(lowest) or "?").." first" end
+ end
+ if H.Stats.simulationError then text=text.." | Sim: "..H.Stats.simulationError
+ elseif H.Stats.bindError then text=text.." | Bind: "..H.Stats.bindError
+ elseif H.Enabled and not H.Waiting and H.Stats.previewStatus~="Ready" then text=text.." | "..tostring(H.Stats.previewStatus) end
+ setLabel(text)
+end
+local elapsed=0
+connections[#connections+1]=RS.RenderStepped:Connect(function(dt)
+ if not H.Running then return end
+ if removeAt and tick()>=removeAt then
+  removeAt=nil
+  local ok,down=pcall(iskeypressed,0x4F)
+  if not ok or down then H.Stop() return end
+ end
+ elapsed=elapsed+(finite(dt) and dt or 0.016)
+ if elapsed<0.03 then return end
+ elapsed=0
+ local ok,err=pcall(render)
+ if not ok then
+  H.Stats.error=tostring(err)
+  hideAll()
+  pcall(setLabel,"Pool helper error: "..tostring(err).." | F7: save diagnostics | Hold O: remove")
+  autoDump("render: "..tostring(err))
+ else H.Stats.error=nil end
+end)
+print("Lucky 8 helper "..H.Version.." loaded. SPACE extra lines / H group / X toggle / F7 diagnostics / hold O remove.")
