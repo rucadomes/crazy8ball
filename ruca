@@ -1132,7 +1132,15 @@ local function lowestBall(balls)
  return lowest
 end
 local function eightIsReady(balls,group)
- if group~="Solid" and group~="Stripe" then return false end
+ if group~="Solid" and group~="Stripe" then
+  local solids,stripes=0,0
+  for _,b in ipairs(balls) do
+   if not b.pocketed then
+    if b.id>=1 and b.id<=7 then solids=solids+1 elseif b.id>=9 and b.id<=15 then stripes=stripes+1 end
+   end
+  end
+  return solids==0 or stripes==0
+ end
  for _,b in ipairs(balls) do
   if not b.pocketed and ((group=="Solid" and b.id>=1 and b.id<=7) or (group=="Stripe" and b.id>=9 and b.id<=15)) then return false end
  end
