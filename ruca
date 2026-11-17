@@ -1345,19 +1345,23 @@ local function bindScene()
  local addr=stick and stick.Address
  if addr~=bound.stickAddress or tick()-(bound.stickTime or 0)>2 then
   bound.stickAddress=addr bound.stickTime=tick()
-  local best,size=nil,0
+  local best,size,alt,asz=nil,0,nil,0
   if stick then
    for _,d in ipairs(stick:GetDescendants()) do
     if isPart(d) then
      local s=d.Size
      if s then
       local m=math.max(s.X,s.Y,s.Z)
-      if m>size then best=d size=m end
+      local mid=s.X+s.Y+s.Z-m-math.min(s.X,s.Y,s.Z)
+      local ok,t=pcall(function() return d.Transparency end)
+      local vis=not (ok and finite(t) and t>0.99)
+      if m>asz then alt=d asz=m end
+      if vis and m>=5*math.max(mid,0.01) and m>size then best=d size=m end
      end
     end
    end
   end
-  bound.cuePart=best
+  bound.cuePart=best or alt
  end
  local lp=Players.LocalPlayer
  local pg=lp and lp:FindFirstChild("PlayerGui")
@@ -1430,19 +1434,30 @@ local function readElevation()
  return C.CueElevation
 end
 local function readSpin()
- local d,b=bound.spinDot,bound.spinBall
- if not d or not b then H.Stats.spinSource="missing" return V(0,0) end
  local ok,res=pcall(function()
-  local dp,ds,bp,bs=d.AbsolutePosition,d.AbsoluteSize,b.AbsolutePosition,b.AbsoluteSize
-  local r=bs.X/2
-  if r<=1 then return nil end
-  local sx=((dp.X+ds.X/2)-(bp.X+bs.X/2))/r
-  local sy=-((dp.Y+ds.Y/2)-(bp.Y+bs.Y/2))/r
-  if not finite(sx) or not finite(sy) then return nil end
-  return V(sx,sy)
+  local hud=bound.hud
+  local sel=hud and hud:FindFirstChild("SpinSelector")
+  local tg=sel and sel:FindFirstChild("SpinToggle")
+  local bb=tg and tg:FindFirstChild("CueBall")
+  local d=bb and bb:FindFirstChild("StrikePoint")
+  if not bb or not d then return nil end
+  local bp,dp=bb.AbsolutePosition,d.AbsolutePosition
+  local size=64
+  local badge=tg:FindFirstChild("CueAngle")
+  if badge then
+   local v=badge.AbsolutePosition.Y-6-bp.Y
+   if finite(v) and v>=30 and v<=100 then size=v end
+  end
+  local c=size/2-7
+  if not (finite(bp.X) and finite(dp.X) and finite(bp.Y) and finite(dp.Y)) then return nil end
+  local nx=(dp.X-bp.X)/c-1
+  local ny=1-(dp.Y-bp.Y)/c
+  if math.abs(nx)<0.03 then nx=0 end
+  if math.abs(ny)<0.03 then ny=0 end
+  return V(clamp(nx,-1,1)*C.MaxSpinOffset,clamp(ny,-1,1)*C.MaxSpinOffset)
  end)
  if ok and res then H.Stats.spinSource="dot" return res end
- H.Stats.spinSource="unreadable"
+ H.Stats.spinSource=ok and "missing" or "unreadable"
  return V(0,0)
 end
 local function readAim(cue)
@@ -1450,7 +1465,6 @@ local function readAim(cue)
  if not part then return nil,"no cue stick" end
  local ok,res,why=pcall(function()
   local t=part.Transparency
-  if finite(t) and t>0.99 then return nil,"cue hidden" end
   local s,cf,p=part.Size,part.CFrame,part.Position
   if not s or not cf or not p then return nil,"cue unreadable" end
   local axis
