@@ -1,6 +1,36 @@
+do
+ local t0=tick()
+ while tick()-t0<90 do
+  local pid=0
+  pcall(function() pid=game.PlaceId end)
+  if pid~=0 and pid~=107430170196919 and pid~=135602970454299 then break end
+  local ok,ld=pcall(function() return game:IsLoaded() end)
+  local lp=nil
+  pcall(function() lp=game:GetService("Players").LocalPlayer end)
+  local pg=nil
+  if lp then pcall(function() pg=lp:FindFirstChild("PlayerGui") end) end
+  if pid~=0 and (not ok or ld) and pg then break end
+  task.wait(0.5)
+ end
+end
+if game.PlaceId~=107430170196919 and game.PlaceId~=135602970454299 then return end
+task.wait(1.5)
 if _G.PoolTrainingHelper then pcall(_G.PoolTrainingHelper.Stop) end
 local H={Enabled=true,Running=true,ShowCollisions=false,Version="lucky8-1",Stats={},Group="Unknown"}
 _G.PoolTrainingHelper=H
+pcall(function() H.JobId=game.JobId H.PlaceId=game.PlaceId end)
+H.Gone=function()
+ local ok,gone=pcall(function()
+  if game.JobId~=H.JobId or game.PlaceId~=H.PlaceId then return true end
+  return game:GetService("Players").LocalPlayer==nil
+ end)
+ return (not ok) or gone==true
+end
+do
+ local L=_G.LUCKY8_LOADER or 'loadstring(game:HttpGet("https://raw.githubusercontent.com/rucadomes/crazy8ball/refs/heads/main/ruca"))()'
+ local q=queue_on_teleport or queueonteleport
+ if type(L)=="string" and type(q)=="function" then pcall(q,("_G.LUCKY8_LOADER=%q\n"):format(L)..L) end
+end
 local MIRROR=false
 local SIM_SLICE=0.006
 local REMOVE_HOLD=0.6
@@ -1866,8 +1896,14 @@ local function render()
  setLabel(text)
 end
 local elapsed=0
+task.spawn(function()
+ while H.Running do
+  if H.Gone() then H.Teleporting=true pcall(H.Stop) break end
+  task.wait(0.1)
+ end
+end)
 connections[#connections+1]=RS.RenderStepped:Connect(function(dt)
- if not H.Running then return end
+ if not H.Running or H.Teleporting then return end
  if removeAt and tick()>=removeAt then
   removeAt=nil
   local ok,down=pcall(iskeypressed,0x4F)
